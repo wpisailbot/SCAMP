@@ -2,6 +2,7 @@
 #include "mcp_can.h"
 #include <SPI.h>
 #include <Servo.h>
+#include <Encoder.h>
 
 #define CAN_CS    A2    // ATMEGA Pin 25, PC2, ADC2
 #define CAN_SCK   13    // ATMEGA Pin 19, PB5
@@ -51,19 +52,11 @@ unsigned char rxBuf[8];
 char msgString[128];
 MCP_CAN CAN0(CAN_CS);     // Set CS to pin 10
 
-const int kWinchPort = DIG_1;
-const int kRudderPort = DIG_2;
-Servo winch, rudder;
+Encoder enc(DIG_2, DIG_3);
 
 void setup(){
   Serial.begin(115200);
-  Serial.println("Testing");
   analogReference(DEFAULT);
-  winch.attach(kWinchPort);
-  rudder.attach(kRudderPort);
-  winch.write(90);
-  rudder.write(90);
-
   // Initialize LEDs
   pinMode(LED_0, OUTPUT);
   pinMode(LED_1, OUTPUT);
@@ -77,52 +70,29 @@ void setup(){
 }
 
 byte tempData[8] = {0x00, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+unsigned long lastsend = 0;
+unsigned long lastreceive = 0;
+int lastenc = 0;
+int airmarval = 0;
 
-void loop(){
+void loop() {
   int newMessages = loopCAN();
-
-  if(newMessages){
-    Serial.println("New messages found");
-  }
-
-  // Echo serial communications
-  // if(Serial.available()) {
-  //   digitalWrite(LED_1, HIGH);
-  //     Serial.write(Serial.read());
-  // }
-  // digitalWrite(LED_1, LOW);
-
-
-
-
   // Blink LED 0 once every 1 second
   if(last_time < millis()){
     last_time += step_time;
 
     digitalWrite(LED_0, count++ % 2);
-//    tempData[0] = 0x00;
-//    tempData[1] = 0x01;
-//    tempData[2] = 0x02;
-//    tempData[3] = 0x03;
-//    tempData[4] = count & 0xff000000;
-//    tempData[5] = count & 0x00ff0000;
-//    tempData[6] = count & 0x0000ff00;
-//    tempData[7] = count & 0x000000ff;
 
-    // Package analog read. Note that we divide by 4 to package into 8 bits
-    tempData[0] = (byte) (analogRead(A0) / 4);
-    int response = sendCANMessage(tempData, 8);
-    if(response){
-      Serial.println("Message sent");
-    } else {
-      Serial.println("Message fail");
-    }
+    *(unsigned int*)(tempData) = millis();
+    *(int*)(tempData+2) = enc.read();
+    *(int*)(tempData+4) = airmarval;
+    *(int*)(tempData+6) = lastenc;
+   // Serial.println(enc.read());
+    
+    int response = sendCANMessage(0x94ff0315, tempData, 8);
+    lastsend = micros();
   }
 }
-
-
-
-
 
 
 // Initialize the CAN Stuff
@@ -133,7 +103,6 @@ void initCAN(){
 
   // Initialize MCP2515 running at 16MHz with a baudrate of 500kb/s and the masks and filters disabled.
   if(CAN0.begin(MCP_STDEXT, CAN_250KBPS, MCP_16MHZ) == CAN_OK){
-    Serial.println("MCP2515 Initialized Successfully!");
   } else {
     Serial.println("Error Initializing MCP2515...");
   }
@@ -144,11 +113,6 @@ void initCAN(){
   // Configuring pin for /INT input
   pinMode(CAN_INT, INPUT);
 }
-
-
-
-
-
 
 // Call this in the main loop
 // It checks for new CAN Messages
@@ -166,13 +130,25 @@ int loopCAN(){
 
     // Determine if ID is standard (11 bits) or extended (29 bits)
     if((rxId & 0x80000000) == 0x80000000){
-      if (rxId == 0x94ff0215 && len >= 2) {
-        winch.write(rxBuf[0]);
-        rudder.write(rxBuf[1]);
-        Serial.print("Setting winch, rudder: ");
-        Serial.print(rxBuf[0]);
-        Serial.print(", ");
-        Serial.println(rxBuf[1]);
+      // Attitude
+      if (false && (rxId & 0x00FFFF00) == 0xF11900 && len >= 2) {
+        // Pitch + Roll calculations are equivalent
+        //airmarval = *(int*)(rxBuf+3); // pitch
+        airmarval = (unsigned)rxBuf[5] + ((unsigned)rxBuf[6] << 8); // roll
+        lastenc = enc.read();
+        lastreceive = micros();
+      }
+      // Heading
+      if (false && (rxId & 0x00FFFF00) == 0xF11200 && len >= 2) {
+        airmarval = *(int*)(rxBuf+1);
+        lastenc = enc.read();
+        lastreceive = micros();
+      }
+      // Rate of Turn
+      if ((rxId & 0x00FFFF00) == 0xF11300 && len >= 2) {
+        airmarval = *(int*)(rxBuf+3);
+        lastenc = enc.read();
+        lastreceive = micros();
       }
     }
   }
@@ -183,9 +159,9 @@ int loopCAN(){
 
 // Send a CAN Message
 // Return 1 on success, 0 otherwise
-int sendCANMessage(byte data[], int dataLength){
+int sendCANMessage(long id, byte data[], int dataLength){
   // send data:  ID = 0x94101315, Extended CAN Frame, Data length = 8 bytes, 'data' = array of data bytes to send
-  byte sndStat = CAN0.sendMsgBuf(0x94ff0115, 1, 8, data);
+  byte sndStat = CAN0.sendMsgBuf(id, 1, 8, data);
   if(sndStat == CAN_OK){
     return 1;
   } else {
